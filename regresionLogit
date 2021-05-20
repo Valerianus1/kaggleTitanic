@@ -1,0 +1,98 @@
+# Transformaciones efectuadas a los datos y regresion logit con prediccion de valores test
+
+library(tidyverse)
+require(DMwR)
+library(boot)
+
+dataSurvived <- read_csv("train.csv")
+data <- read_csv("train.csv")
+data <- select(data, -Survived)
+test <- read_csv("test.csv")
+
+datatest <- rbind(data, test)
+
+large <- rbind(data, test)
+
+large$familyname <- str_match(large$Name ,"(\\w*),")[, 2] #[,1] returns complete match, [,2] returns first match group
+large$husbandname <- str_match(large$Name ,"Mrs\\. ([\\w\\s]*)")[, 2]
+large$husbandname <- ifelse(!is.na(large$husbandname), large$husbandname, str_match(large$Name ,'"Mrs ([\\w\\s]*)"')[, 2]) 
+large$husbandname <- trimws(large$husbandname, which=("right")) #removes whitespace at the end of string
+large$title <-  str_match(large$Name ,"(\\w*)\\.")[, 2]
+large$master <- ifelse(str_detect(large$Name, "Master"), 1, 0)
+large$Miss <- ifelse(large$title %in% c("Miss", "Ms", "Mlle", "Mme", "Dona", "Countess"), 1, 0)
+large$Mrs <- ifelse(large$title %in% c("Mrs", "Lady"), 1, 0)
+large$Mr <- ifelse(large$title %in% c("Mr", "Don"), 1, 0)
+large$otherMale <- ifelse(large$title %in% c("Capt", "Sir", "Col", "Dr", "Jonkheer", "Major"), 1, 0) # Master ya tiene su dummy
+
+travelledWithHusband <- function(data) {
+  data$spouseAboard <- 0
+  for (i in 1:nrow(data)) {
+    if (!is.na(data[[i, "husbandname"]]) & sum(str_detect(large$Name, paste0(data[[i, "familyname"]], ", Mr. ", data[[i, "husbandname"]]))) > 0 & data[[i , "SibSp"]]>0) {
+      data[[i, "spouseAboard"]] <- 1
+    }
+  }
+  return(data)
+}
+updateHusband <- function(data){ 
+  dat <- data[data$spouseAboard>0 & data$Sex=="female", ] #solo incluye las esposas
+  ids <- vector(mode="numeric", length=nrow(dat)) #pre-allocate vector length to make it more efficient
+  for (i in 1:nrow(dat)) { 
+    husbandid <- which(str_detect(large$Name, paste0(dat[[i, "familyname"]], ", Mr. ", dat[[i, "husbandname"]])) & data[ , "SibSp"]>0 )
+    #tuve problema con el hijo de una pareja que tenia el nombre del padre+jr, use el truco de requerir que SibSp>0 pero no tendria por que ser una solucion en todos los casos
+    ids[i] <- husbandid
+  }
+  data[ids, "spouseAboard"] <- 1
+  return(data)
+}
+
+large <-  travelledWithHusband(large)
+large <- updateHusband(large)
+
+large$siblings <- large$SibSp - large$spouseAboard
+
+large$noPeopleTicket <- as.numeric(table(large$Ticket)[large$Ticket]) 
+
+train <- large[large$PassengerId %in% data$PassengerId , ]
+
+masterData <-  filter(large, master==1) %>%  select(-master, -PassengerId, -Name, -Sex, -Ticket, -Cabin, -Embarked, -familyname, -husbandname, -title, -spouseAboard, -Miss, -Mrs,-Mr, -otherMale)
+masterDataTrain <-filter(train, master==1) %>%  select(-master, -PassengerId, -Name, -Sex, -Ticket, -Cabin, -Embarked, -familyname, -husbandname, -title, -spouseAboard, -Miss, -Mrs,-Mr, -otherMale)
+
+masterDataKnn <-  round(knnImputation(as.data.frame(masterData), distData=as.data.frame(masterDataTrain)), digits=2) %>% cbind(PassengerId=filter(large, master==1)$PassengerId) %>% left_join(large, by="PassengerId", suffix = c("", ".y")) %>% select_at(vars(-ends_with(".y")))
+
+nonMasterData <-  filter(large, master==0) %>%  select(-master, -PassengerId, -Name, -Sex, -Ticket, -Cabin, -Embarked, -familyname, -husbandname, -title, -spouseAboard, -Miss, -Mrs,-Mr, -otherMale)
+nonMasterDataTrain <-filter(train, master==0) %>%  select(-master, -PassengerId, -Name, -Sex, -Ticket, -Cabin, -Embarked, -familyname, -husbandname, -title, -spouseAboard, -Miss, -Mrs,-Mr, -otherMale)
+nonMasterDataKnn <-  round(knnImputation(as.data.frame(nonMasterData), distData=as.data.frame(nonMasterDataTrain)), digits=2) %>% cbind(PassengerId=filter(large, master==0)$PassengerId) %>% left_join(large, by="PassengerId", suffix = c("", ".y")) %>% select_at(vars(-ends_with(".y")))
+
+large2 <- rbind(nonMasterDataKnn, masterDataKnn)
+row.names(large2) <- large2$PassengerId
+large2 <- arrange(large2, PassengerId)
+train2 <- large2[large2$PassengerId %in% data$PassengerId , ] %>% select(-PassengerId, -Name, -Ticket, -SibSp, -familyname, -husbandname, -title, -Cabin)
+train2$Embarked <- factor(train2$Embarked)
+train2$Sex <- factor(train2$Sex)
+train2Knn <- knnImputation(train2) %>% cbind(PassengerId=train$PassengerId) %>% left_join(train, by="PassengerId", suffix = c("", ".y")) %>% select_at(vars(-ends_with(".y")))
+
+large3 <- rbind(train2Knn, large2[!large2$PassengerId %in% train2Knn$PassengerId , ])
+row.names(large3) <- large3$PassengerId
+large3 <- arrange(large3, PassengerId)
+
+dfport <- model.matrix(~factor(large3$Embarked)-1)
+large3 <- select(large3, -Embarked) %>% cbind(Cherbourg=dfport[,1], Queenstown=dfport[,2], Southampton=dfport[,3])
+row.names(large3) <- large3$PassengerId
+large3 <- select(large3, -Name, -Ticket, -Cabin, -husbandname, -familyname, -title, -SibSp)
+
+levels(large3$Sex) <- c(1, 0)
+large3$Sex <- as.numeric(levels(large3$Sex)[large3$Sex])
+large3$Age <- scale(large3$Age)
+large3$Fare <- scale(large3$Fare)
+trainLogit <- large3[large3$PassengerId %in% data$PassengerId , ] %>% arrange(PassengerId) %>%   select(-PassengerId, -Cherbourg, -Mr) %>% cbind(Survived=dataSurvived$Survived)
+testLogit <- large3[!large3$PassengerId %in% data$PassengerId , ] %>% arrange(PassengerId) %>%  select(-PassengerId, -Cherbourg, -Mr)
+
+logit <- glm(Survived~. + Age*Age + Pclass*Fare + Sex*spouseAboard + Age*noPeopleTicket + Fare*Fare + Parch*Parch + noPeopleTicket*noPeopleTicket, family="binomial", trainLogit)
+logitpreds <- predict(logit, testLogit)
+logitpreds2 <- as.numeric(logitpreds>0.5)
+logitpredstrain <- as.numeric(predict(logit, trainLogit[ , -15])>0.5)
+summary(logit)
+mean(logitpredstrain==dataSurvived$Survived)
+cv.glm(trainLogit, logit, K=10)
+predictions <- data.frame(PassengerId=test$PassengerId, Survived=logitpreds2)
+write_csv(predictions, "predictionslogit2.csv")
